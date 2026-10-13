@@ -1,2 +1,7 @@
+numpy==2.5.3
+pandas==3.0.6
+pytest==9.1.1
+scikit-learn==1.9.1
+skore==0.26.0
 skore-cli==0.4.1
-pytest
+skrub==0.11.0

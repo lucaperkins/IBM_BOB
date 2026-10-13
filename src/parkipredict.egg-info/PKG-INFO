@@ -1,5 +1,0 @@
-Metadata-Version: 2.4
-Name: parkipredict
-Version: 0.1.0
-Summary: Workspace package for Parkinson's UPDRS true-OFF score prediction experiments.
-Requires-Python: >=3.11

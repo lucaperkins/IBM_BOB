@@ -33,3 +33,4 @@ skills/
 
 # local git worktrees
 .worktrees/
+*.egg-info/

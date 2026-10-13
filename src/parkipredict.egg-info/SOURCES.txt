@@ -1,7 +1,0 @@
-README.md
-pyproject.toml
-src/parkipredict.egg-info/PKG-INFO
-src/parkipredict.egg-info/SOURCES.txt
-src/parkipredict.egg-info/dependency_links.txt
-src/parkipredict.egg-info/top_level.txt
-tests/test_setup.py
