@@ -12,8 +12,8 @@ stem).
 
 - **Project / dataset:** Parkinson's Disease UPDRS score prediction (patient visit tabular data)
 - **Goal:** Predict a patient's composite UPDRS score (`target`) from clinical visit features (age, medication, prior UPDRS sub-scores)
-- **Last experiment:** 03_hgbr_tabular - done
-- **Last result:** RMSE 7.45 ± 0.14, MAE 5.85 ± 0.10, R² 0.796 (GroupKFold 5-fold)
+- **Last experiment:** 04_best - done
+- **Last result:** RMSE 4.55 ± 0.08 (GroupKFold 5-fold); vs 03_hgbr_tabular RMSE 7.45 ± 0.14
 
 - **Workspace decisions** (immutable unless the user pivots):
   - tabular library: pandas - recorded: 2025-10-07
@@ -40,6 +40,7 @@ stem).
 | `01_dummy` | DummyRegressor(mean) — visit-level 80/20 holdout floor | done | RMSE 16.48, MAE 13.48 | [design note](01_dummy.md) |
 | `02_ridge` | Ridge + median imputation, GroupKFold(5) patient-grouped CV | done | RMSE 10.60 ± 0.27, R² 0.587 | [design note](02_ridge.md) |
 | `03_hgbr_tabular` | skrub tabular_pipeline all features + time_since_diagnosis, GroupKFold(5) | done | RMSE 7.45 ± 0.14, R² 0.796 | [design note](03_hgbr_tabular.md) |
+| `04_best` | temporal neighbours + per-patient off aggregates + missingness flags + tuned HGBR (RandomizedSearchCV GroupKFold inner CV), GroupKFold(5) outer | done | RMSE 4.55 ± 0.08 | [design note](04_best.md) |
 
 ## Backlog
 
