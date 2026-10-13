@@ -1,71 +1,71 @@
-<p align="center">
-  <img src="docs/figures/probabl-logo.svg" alt="Probabl" height="100">
-  &nbsp;&nbsp;&nbsp;&nbsp;
-  <img src="docs/figures/ibm-logo.svg" alt="IBM" height="60">
-</p>
-# Help science build better Parkinson's evaluation
+# IBM_BOB: Parkinson's true-OFF score prediction
 
-*Predicting and correcting bias in motor score evaluation — for each visit, predict the unbiased (“true”) OFF MDS-UPDRS motor score.*
+Team project for the ESILV Machine Learning "bobathon" ([Kaggle: bobathon-esilv](https://www.kaggle.com/competitions/bobathon-esilv/)). For each patient visit, we predict the unbiased ("true") OFF MDS-UPDRS motor score (`target`). The metric is RMSE, and lower is better. Test patients never appear in train, so we validate with patient-grouped CV.
 
-## Getting started
+- **Team:** <names of the 4 teammates>
+- **Kaggle team:** <exact team name>
+- **Skore Hub workspace:** `parkipredict`, project `bobathon-esilv`
+- **Background and data description:** [docs/CONTEXT.md](docs/CONTEXT.md)
+- **Original lab guides:** [SETUP](docs/SETUP.md), [DAY1](docs/DAY1.md), [DAY2](docs/DAY2.md)
 
+## Current status
+
+All scores below are RMSE, and every experiment is tracked in [journal/JOURNAL.md](journal/JOURNAL.md).
+
+| Key | Model | Validation | RMSE | Kaggle public | Hub report |
+|---|---|---|---|---|---|
+| `01_dummy` | Mean predictor | 80/20 random visit split | 16.48 | <score> | <url> |
+| `02_ridge` | Ridge, median imputation, 8 numeric features | GroupKFold(5) on `patient_id` | 10.60 ± 0.27 | <score> | [report](https://skore.probabl.ai/parkipredict/bobathon-esilv/cross-validations/66415) |
+| `03_...` | | | | | |
+
+**Next:** HistGradientBoosting / skrub `tabular_pipeline` with categorical columns and `time_since_diagnosis = age - age_at_diagnosis`.
+
+## Getting started (each teammate, on their own machine)
+
+1. Accept the GitHub invite, then clone:
 ```bash
-git clone https://github.com/probabl-ai/bobathon-esilv.git
-cd bobathon-esilv
+   git clone https://github.com/lucaperkins/IBM_BOB.git
+   cd IBM_BOB
 ```
-
-The lab has three steps. Do them **in order**: each one assumes the previous one is finished.
-
-
-| Step | Guide                     | What you do                                                                                                |
-| ---- | ------------------------- | ---------------------------------------------------------------------------------------------------------- |
-| 1    | [SETUP.md](docs/SETUP.md) | Join Kaggle, form a team, install Python, create the shared Skore Hub workspace, install skore and sign in |
-| 2    | [DAY1.md](docs/DAY1.md)   | Download the data, explore it (EDA), push a dummy baseline to Skore Hub                                    |
-| 3    | [DAY2.md](docs/DAY2.md)   | Build real models, evaluate them with patient-grouped cross-validation, submit to Kaggle                   |
-
-
-### Step 1 — Setup ([SETUP.md](docs/SETUP.md))
-
-Follow every section of [SETUP.md](docs/SETUP.md):
-
-1. **Join Kaggle and form a team** (maximum four people). Remember the exact team name.
-2. **Install Python 3.12 or newer** and check it with `python --version` (or `python3 --version`).
-3. **Create one Skore Hub workspace per team** on [skore.probabl.ai](https://skore.probabl.ai), named like the Kaggle team. One teammate creates it and invites the others.
-4. **Allow Bob to use the lab skills** (tick **Skill** in Bob's Permissions menu), then **install skore and sign in** from the repo root.
-
-#### Check your setup before moving on
-
-Run the setup tests, with the virtual environment still active:
-
+2. Join the Skore Hub workspace `parkipredict` (you need an invite) and join our Kaggle team.
+3. Follow [docs/SETUP.md](docs/SETUP.md) step 5 to create the venv, install requirements, install the Bob skills, sign in to Skore, and run the checks. Then install the project package:
 ```bash
-python -m pytest
+   pip install -e .
+   python -m pytest   # must end with "all passed"
 ```
+   `.skore` (your personal API key), `.venv/` and `.bob/skills/` are per machine and are not in git.
+4. In Bob, tick **Skill** in the Permissions menu for each new chat.
 
-See [SETUP.md step 5](docs/SETUP.md#5-install-skore-and-check-your-setup) for details.
+## Workflow
 
-**You cannot proceed to Day 1 until the last line says** `all passed`**.** Without a working `.skore`, you cannot push reports to Skore Hub, and every Kaggle Submission needs a Hub report URL.
+- **Before you start:** `git pull`, then read `journal/JOURNAL.md` to see what has been tried.
+- **Run an experiment:** prompt Bob. All code must be written and run in Bob with evaluation through skore.
+- **Use patient-grouped CV** (`GroupKFold` on `patient_id`) for every model, never a random row split.
+- **When Bob finishes:** make sure `journal/JOURNAL.md` is updated, then run:
+```bash
+  git add -A
+  git commit -m "<key>: <one-line result>"
+  git push
+```
+- **Submit to Kaggle:** upload `submissions/<key>.csv` (header `Index,target`, one row per test visit) with the Skore Hub report URL in the Submission Description. `submissions/` is gitignored, so regenerate the CSV from `experiments/<key>.py` if you need it.
 
-### Step 2 — Day 1 ([DAY1.md](docs/DAY1.md))
+## Rules
 
-1. Download the CSVs from the [competition Data tab](https://www.kaggle.com/competitions/bobathon-esilv/data) into `data/`.
-2. Explore the data in Bob (EDA) and go through the workbook questions.
-3. Build a **dummy mean** baseline, evaluate it with `skore.evaluate`, and `put` it to Skore Hub as `01_dummy`. Every later model must beat this score.
+- Each Kaggle submission needs a **new** Hub report key. Never reuse a key, and never use the reserved key `eda`.
+- Claim the next key below before you start, so two people don't take the same number.
 
-### Step 3 — Day 2 ([DAY2.md](docs/DAY2.md))
+| Key | Owner | Idea |
+|---|---|---|
+| `03` | <name> | <idea> |
+| `04` | <name> | <idea> |
 
-1. Train a **Ridge** linear model, compare it with the dummy, and make your **first Kaggle Submission**.
-2. Switch to **patient-grouped cross-validation** (`GroupKFold`) so the score matches the Kaggle split.
-3. Try **HistGradientBoosting** (missing values as signal), skrub `**tabular_pipeline`** (categorical columns), and skrub **DataOps** (groups baked into the graph).
-4. Fit your best model on all training visits and **submit again**.
+## Repository layout
 
-## Documents
-
-- [SETUP.md](docs/SETUP.md) - Kaggle team, Python, Skore Hub workspace, skore install and sign-in
-- [DAY1.md](docs/DAY1.md) - data, exploratory data analysis (EDA), dummy baseline
-- [DAY2.md](docs/DAY2.md) - models, grouped cross-validation, Kaggle Submissions
-- [CONTEXT.md](docs/CONTEXT.md) - scientific background, goals, and modelling pitfalls for the Parkinson's dataset
-- Kaggle competition: [bobathon-esilv](https://www.kaggle.com/competitions/bobathon-esilv/)
-
-## Submission rules
-
-All code must be written and run in **Bob** (IDE or CLI), with evaluation through **skore**. Every Kaggle upload must put a Skore Hub EstimatorReport URL (`https://skore.probabl.ai/…`) in the Submission Description, and each Submission needs a **new** report key (`01_dummy`, `02_ridge`, …). Each experiment writes its file to `submissions/<report-key>.csv` (e.g. `submissions/02_ridge.csv`), so the filename matches the report key and a later model never overwrites an earlier submission. See the [competition rules](https://www.kaggle.com/competitions/bobathon-esilv/rules) for eligibility and what makes a Submission valid.
+| Path | What it is |
+|---|---|
+| `data/` | Competition CSVs and the EDA outputs |
+| `experiments/` | One script per experiment (`01_dummy.py`, ...) |
+| `journal/` | `JOURNAL.md` index and one design note per experiment |
+| `src/parkipredict/` | Shared project code |
+| `audit/`, `tests/` | Pipeline audits and setup checks |
+| `docs/` | Original lab guides and background |
