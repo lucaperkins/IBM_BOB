@@ -9,6 +9,9 @@
                                  and missingness flags for 04_best.
 ``build_best_learner``         — tuned HGBR via RandomizedSearchCV with
                                  patient-grouped inner CV (04_best).
+``add_pk_rater_features``      — PK decay features, rater-bias corrector, and
+                                 within-patient linear trajectory for 05_pk_rater.
+``build_pk_rater_learner``     — same tuned HGBR as 04_best plus new features.
 
 Each builder is independent so experiments import only what they need.
 """
@@ -335,6 +338,197 @@ def build_best_learner(
 
     hgbr = HistGradientBoostingRegressor(**(hgbr_params or {}))
 
+    tabular_steps_no_last = tabular.steps[:-1]
+    return Pipeline(
+        steps=[
+            ("add_features", feature_step),
+            ("drop_patient_id", drop_step),
+            *tabular_steps_no_last,
+            ("histgradientboostingregressor", hgbr),
+        ]
+    )
+
+
+# ---------------------------------------------------------------------------
+# 05_pk_rater
+# ---------------------------------------------------------------------------
+
+#: Hardened best HGBR hyperparameters from 04_best RandomizedSearchCV.
+HGBR_PARAMS_04: dict = {
+    "learning_rate": 0.017171860465888467,
+    "max_leaf_nodes": 132,
+    "max_iter": 497,
+    "min_samples_leaf": 95,
+    "l2_regularization": 5.1401896641681114e-05,
+    "random_state": 0,
+}
+
+
+def add_pk_rater_features(X: pd.DataFrame) -> pd.DataFrame:
+    """Add PK-decay, rater-bias, and within-patient trajectory features.
+
+    All features are computed on X only — never on the target.
+
+    PK timing (columns ``time_since_intake_on``, ``time_since_intake_off``):
+      For tau in {1, 2, 4} hours:
+        decay_on_<tau>h  = exp(−time_since_intake_on / tau)
+        decay_off_<tau>h = exp(−time_since_intake_off / tau)
+        interact_on_<tau>h  = on  * decay_on_<tau>h   (0 when on is NaN)
+        interact_off_<tau>h = off * decay_off_<tau>h  (0 when off is NaN)
+      decay_ratio_on_off = decay_on_1h / (decay_off_1h + 1e-9) when both exist.
+
+    Rater corrector (column ``rater_id``):
+      rater_id is kept as-is for TableVectorizer categorical encoding.
+      rater_bias_off = per-rater mean of (off − patient_mean_off), broadcast.
+      rater_bias_on  = per-rater mean of (on  − patient_mean_on),  broadcast.
+
+    Trajectory (linear regression of off ~ age and on ~ age within patient):
+      traj_off_slope, traj_off_intercept
+      traj_on_slope,  traj_on_intercept
+      traj_off_pred   = traj_off_intercept + traj_off_slope * age
+      traj_on_pred    = traj_on_intercept  + traj_on_slope  * age
+
+    Parameters
+    ----------
+    X :
+        Feature DataFrame with at minimum ``patient_id``, ``age``, ``on``,
+        ``off``, ``time_since_intake_on``, ``time_since_intake_off``,
+        ``rater_id``.  Must NOT contain ``target``.
+
+    Returns
+    -------
+    pd.DataFrame
+        Copy of ``X`` with additional feature columns; original index preserved.
+    """
+    import numpy as np
+
+    X = X.copy()
+
+    # ------------------------------------------------------------------
+    # 1. PK decay features
+    # ------------------------------------------------------------------
+    tsi_on = X["time_since_intake_on"]   # hours, may be NaN
+    tsi_off = X["time_since_intake_off"]  # hours, may be NaN
+
+    for tau in (1, 2, 4):
+        d_on = np.exp(-tsi_on / tau)
+        d_off = np.exp(-tsi_off / tau)
+        X[f"decay_on_{tau}h"] = d_on
+        X[f"decay_off_{tau}h"] = d_off
+        # interaction: 0 where on/off is NaN (fill_value=0 to avoid NaN × NaN)
+        X[f"interact_on_{tau}h"] = X["on"].fillna(0) * d_on.fillna(0)
+        X[f"interact_off_{tau}h"] = X["off"].fillna(0) * d_off.fillna(0)
+
+    # Ratio only where both decay values are available
+    d_on1 = X["decay_on_1h"]
+    d_off1 = X["decay_off_1h"]
+    both_exist = d_on1.notna() & d_off1.notna()
+    X["decay_ratio_on_off"] = np.where(both_exist, d_on1 / (d_off1 + 1e-9), np.nan)
+
+    # ------------------------------------------------------------------
+    # 2. Rater-bias corrector
+    # ------------------------------------------------------------------
+    # patient-level means (broadcast, NaN-safe)
+    pat_grp = X.groupby("patient_id", sort=False)
+    patient_mean_off = pat_grp["off"].transform("mean")
+    patient_mean_on = pat_grp["on"].transform("mean")
+
+    # deviation from patient mean (NaN where off/on is NaN)
+    dev_off = X["off"] - patient_mean_off
+    dev_on = X["on"] - patient_mean_on
+
+    # per-rater mean deviation, then broadcast back to rows
+    tmp = X[["rater_id"]].copy()
+    tmp["dev_off"] = dev_off
+    tmp["dev_on"] = dev_on
+    rater_bias_off = tmp.groupby("rater_id")["dev_off"].transform("mean")
+    rater_bias_on = tmp.groupby("rater_id")["dev_on"].transform("mean")
+    X["rater_bias_off"] = rater_bias_off
+    X["rater_bias_on"] = rater_bias_on
+
+    # ------------------------------------------------------------------
+    # 3. Within-patient linear trajectory (off ~ age, on ~ age)
+    # ------------------------------------------------------------------
+    traj_cols = {
+        "traj_off_slope": np.nan,
+        "traj_off_intercept": np.nan,
+        "traj_off_pred": np.nan,
+        "traj_on_slope": np.nan,
+        "traj_on_intercept": np.nan,
+        "traj_on_pred": np.nan,
+    }
+    for col, default in traj_cols.items():
+        X[col] = default
+
+    for pid, grp_df in pat_grp:
+        ages = grp_df["age"].values.astype(float)
+        idx = grp_df.index
+
+        # off trajectory
+        off_vals = grp_df["off"].values.astype(float)
+        mask_off = ~np.isnan(off_vals) & ~np.isnan(ages)
+        if mask_off.sum() >= 2:
+            slope_off, intercept_off = np.polyfit(ages[mask_off], off_vals[mask_off], 1)
+        else:
+            slope_off, intercept_off = 0.0, np.nanmean(off_vals) if mask_off.any() else np.nan
+        X.loc[idx, "traj_off_slope"] = slope_off
+        X.loc[idx, "traj_off_intercept"] = intercept_off
+        X.loc[idx, "traj_off_pred"] = intercept_off + slope_off * ages
+
+        # on trajectory
+        on_vals = grp_df["on"].values.astype(float)
+        mask_on = ~np.isnan(on_vals) & ~np.isnan(ages)
+        if mask_on.sum() >= 2:
+            slope_on, intercept_on = np.polyfit(ages[mask_on], on_vals[mask_on], 1)
+        else:
+            slope_on, intercept_on = 0.0, np.nanmean(on_vals) if mask_on.any() else np.nan
+        X.loc[idx, "traj_on_slope"] = slope_on
+        X.loc[idx, "traj_on_intercept"] = intercept_on
+        X.loc[idx, "traj_on_pred"] = intercept_on + slope_on * ages
+
+    return X
+
+
+def _add_all_features_05(X: pd.DataFrame) -> pd.DataFrame:
+    """Apply 04_best features, time_since_diagnosis, and 05 PK/rater/trajectory features."""
+    return add_pk_rater_features(add_time_since_diagnosis(add_best_features(X)))
+
+
+def _drop_patient_id_05(X: pd.DataFrame) -> pd.DataFrame:
+    """Drop patient_id before TableVectorizer (module-level for pickle)."""
+    return X.drop(columns=["patient_id"], errors="ignore")
+
+
+def build_pk_rater_learner(
+    hgbr_params: "dict | None" = None,
+    data_dir_preview: "str | Path | None" = None,  # noqa: ARG001
+) -> "Pipeline":
+    """Return an unfit pipeline for 05_pk_rater.
+
+    Extends 04_best with PK-decay, rater-bias, and trajectory features.
+    Uses ``HGBR_PARAMS_04`` by default (the tuned params from 04_best);
+    pass a different dict to override.
+
+    Parameters
+    ----------
+    hgbr_params :
+        HGBR hyperparameter dict.  Defaults to ``HGBR_PARAMS_04``.
+    data_dir_preview :
+        Unused.  Accepted for API consistency.
+
+    Returns
+    -------
+    Pipeline
+        sklearn Pipeline: feature engineering → TableVectorizer → HGBR.
+    """
+    from sklearn.ensemble import HistGradientBoostingRegressor
+    from sklearn.preprocessing import FunctionTransformer
+
+    params = hgbr_params if hgbr_params is not None else HGBR_PARAMS_04
+    feature_step = FunctionTransformer(_add_all_features_05)
+    drop_step = FunctionTransformer(_drop_patient_id_05)
+    tabular = skrub.tabular_pipeline("regressor")
+    hgbr = HistGradientBoostingRegressor(**params)
     tabular_steps_no_last = tabular.steps[:-1]
     return Pipeline(
         steps=[
