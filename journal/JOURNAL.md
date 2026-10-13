@@ -1,0 +1,47 @@
+# JOURNAL
+
+<!--
+Durable index of every experiment in this workspace. Four sections,
+in order: Status, Data understanding (EDA), History, Backlog - keep
+them so the file stays quick to scan. Each journal/NN_short_name.md
+design note pairs one-to-one with experiments/NN_short_name.py (same
+stem).
+-->
+
+## Status
+
+- **Project / dataset:** Parkinson's Disease UPDRS score prediction (patient visit tabular data)
+- **Goal:** Predict a patient's composite UPDRS score (`target`) from clinical visit features (age, medication, prior UPDRS sub-scores)
+- **Last experiment:** 02_ridge - done
+- **Last result:** RMSE 10.60 ± 0.27, MAE 8.53 ± 0.18, R² 0.587 (GroupKFold 5-fold)
+
+- **Workspace decisions** (immutable unless the user pivots):
+  - tabular library: pandas - recorded: 2025-10-07
+  - env manager: pip+venv - recorded: 2025-10-07
+  - agent feature: <installed> - recorded: <YYYY-MM-DD>
+  - optional features: none - recorded: 2025-10-07
+  - package name (`src/<pkg>/`): parkipredict - recorded: 2025-10-07
+  - skore mode: hub - recorded: 2025-10-07
+  - skore hub workspace: parkipredict - recorded: 2025-10-07
+  - skore mlflow tracking uri: n/a - recorded: 2025-10-07
+  - student prior: some-sklearn - recorded: 2025-10-07
+  - CV splitter family: GroupKFold (for patient-grouped experiments; splitter=0.2 for 01_dummy/02_ridge) - recorded: 2025-10-07
+
+## Data understanding (EDA)
+
+- **Status:** done - 2025-10-07
+- **Summary:** 44,590 rows × 13 columns (12 features + `target`). 5,576 unique patients with multiple visits each — `GroupKFold(patient_id)` is required for CV. `off` and `on` (UPDRS sub-scores) are the dominant predictors (Pearson r = 0.87 and 0.67). Heavy missingness in `ledd` (37%), `time_since_intake_on` (46%), `time_since_intake_off` (79%) — an estimator handling NaNs natively (e.g., `HistGradientBoostingRegressor`) is indicated.
+- **Report:** [data/eda.md](../data/eda.md)
+
+## History
+
+| Stem | Intent (one line) | Status | Headline result | Design note |
+|---|---|---|---|---|
+| `01_dummy` | DummyRegressor(mean) — visit-level 80/20 holdout floor | done | RMSE 16.48, MAE 13.48 | [design note](01_dummy.md) |
+| `02_ridge` | Ridge + median imputation, GroupKFold(5) patient-grouped CV | done | RMSE 10.60 ± 0.27, R² 0.587 | [design note](02_ridge.md) |
+
+## Backlog
+
+| # | Item | Source |
+|---|---|---|
+| <!-- B1 --> | <!-- "investigate target-bin>0.95 residual bias via target transform" --> | <!-- `skore:01_baseline` --> |
