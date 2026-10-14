@@ -22,6 +22,7 @@ from pathlib import Path
 
 import pandas as pd
 import skrub
+from sklearn.base import BaseEstimator, RegressorMixin
 from sklearn.dummy import DummyRegressor
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import Ridge
@@ -538,3 +539,200 @@ def build_pk_rater_learner(
             ("histgradientboostingregressor", hgbr),
         ]
     )
+
+
+# ---------------------------------------------------------------------------
+# 06_residual_ens  (Variant A: residual learner; Variant B: HGBR ensemble)
+# ---------------------------------------------------------------------------
+
+
+def compute_off_proxy(
+    X: pd.DataFrame,
+    fallback_mean: "float | None" = None,
+) -> pd.Series:
+    """Compute off_proxy: off if present, else traj_off_pred, else nearest_off.
+
+    Requires that ``add_pk_rater_features`` has already been called so that
+    ``traj_off_pred`` and ``nearest_off`` columns exist.
+
+    Parameters
+    ----------
+    X :
+        Featurized DataFrame (post add_pk_rater_features).
+    fallback_mean :
+        Value used to fill any remaining NaN after off, traj_off_pred, and
+        nearest_off are exhausted.  If ``None``, uses ``X["off"].mean()``.
+
+    Returns
+    -------
+    pd.Series
+        off_proxy values aligned on X.index; no NaN values remain.
+    """
+    proxy = X["off"].copy()
+    missing = proxy.isna()
+    proxy[missing] = X.loc[missing, "traj_off_pred"]
+    still_missing = proxy.isna()
+    proxy[still_missing] = X.loc[still_missing, "nearest_off"]
+    # Final fallback: use provided mean or compute from available values
+    if proxy.isna().any():
+        fill = fallback_mean if fallback_mean is not None else float(proxy.mean())
+        proxy = proxy.fillna(fill)
+    return proxy
+
+
+class _ResidualLearner(BaseEstimator, RegressorMixin):
+    """Variant A: fit HGBR on (target − off_proxy), predict residual + off_proxy.
+
+    Parameters
+    ----------
+    hgbr_params :
+        HGBR hyperparameter dict passed to HistGradientBoostingRegressor.
+    """
+
+    def __init__(self, hgbr_params: dict) -> None:
+        self.hgbr_params = hgbr_params
+
+    def fit(self, X: pd.DataFrame, y: pd.Series) -> "_ResidualLearner":
+        from sklearn.ensemble import HistGradientBoostingRegressor
+
+        # Build all features (keep patient_id for feature engineering)
+        X_feat = _add_all_features_05(X)
+        # Store train-time off mean for consistent NaN fallback at predict time
+        self._off_global_mean = float(X_feat["off"].mean())
+        off_proxy = compute_off_proxy(X_feat, fallback_mean=self._off_global_mean)
+
+        # Drop patient_id before vectorizer
+        X_drop = _drop_patient_id_05(X_feat)
+
+        tv = skrub.tabular_pipeline("regressor").named_steps["tablevectorizer"]
+        self._tv = tv
+        X_vec = tv.fit_transform(X_drop)
+
+        self._hgbr = HistGradientBoostingRegressor(**self.hgbr_params)
+        residual = y.values - off_proxy.values
+        self._hgbr.fit(X_vec, residual)
+        return self
+
+    def predict(self, X: pd.DataFrame) -> "pd.ndarray":
+        X_feat = _add_all_features_05(X)
+        off_proxy = compute_off_proxy(X_feat, fallback_mean=self._off_global_mean)
+        X_drop = _drop_patient_id_05(X_feat)
+        X_vec = self._tv.transform(X_drop)
+        residual_pred = self._hgbr.predict(X_vec)
+        return residual_pred + off_proxy.values
+
+    # sklearn-compatible duck-typing
+    def get_params(self, deep: bool = True) -> dict:  # noqa: FBT001
+        return {"hgbr_params": self.hgbr_params}
+
+    def set_params(self, **params: object) -> "_ResidualLearner":
+        if "hgbr_params" in params:
+            self.hgbr_params = params["hgbr_params"]
+        return self
+
+
+def build_residual_learner(
+    hgbr_params: "dict | None" = None,
+    data_dir_preview: "str | Path | None" = None,  # noqa: ARG001
+) -> "_ResidualLearner":
+    """Return an unfit residual learner for Variant A of 06_residual_ens.
+
+    Predicts (target − off_proxy) then adds back off_proxy at inference.
+
+    Parameters
+    ----------
+    hgbr_params :
+        HGBR hyperparameter dict.  Defaults to ``HGBR_PARAMS_04``.
+    data_dir_preview :
+        Unused.  Accepted for API consistency.
+
+    Returns
+    -------
+    _ResidualLearner
+        Sklearn-duck-typed estimator.
+    """
+    return _ResidualLearner(hgbr_params=hgbr_params or HGBR_PARAMS_04)
+
+
+class _EnsembleLearner(BaseEstimator, RegressorMixin):
+    """Variant B: average predictions of 5 HGBR models with different random seeds.
+
+    Wraps the full 05_pk_rater pipeline (features + TV + HGBR) five times,
+    differing only in ``random_state``.
+
+    Parameters
+    ----------
+    hgbr_params :
+        Base HGBR hyperparameter dict.  ``random_state`` is overridden per member.
+    n_members :
+        Number of ensemble members (default 5).
+    """
+
+    def __init__(self, hgbr_params: dict, n_members: int = 5) -> None:
+        self.hgbr_params = hgbr_params
+        self.n_members = n_members
+
+    def _make_member(self, seed: int) -> Pipeline:
+        from sklearn.ensemble import HistGradientBoostingRegressor
+        from sklearn.preprocessing import FunctionTransformer
+
+        params = {**self.hgbr_params, "random_state": seed}
+        feature_step = FunctionTransformer(_add_all_features_05)
+        drop_step = FunctionTransformer(_drop_patient_id_05)
+        tabular = skrub.tabular_pipeline("regressor")
+        hgbr = HistGradientBoostingRegressor(**params)
+        tabular_steps_no_last = tabular.steps[:-1]
+        return Pipeline(
+            steps=[
+                ("add_features", feature_step),
+                ("drop_patient_id", drop_step),
+                *tabular_steps_no_last,
+                ("histgradientboostingregressor", hgbr),
+            ]
+        )
+
+    def fit(self, X: pd.DataFrame, y: pd.Series) -> "_EnsembleLearner":
+        self._members = []
+        for seed in range(self.n_members):
+            m = self._make_member(seed)
+            m.fit(X, y)
+            self._members.append(m)
+        return self
+
+    def predict(self, X: pd.DataFrame) -> "pd.ndarray":
+        import numpy as np
+
+        preds = np.stack([m.predict(X) for m in self._members], axis=0)
+        return preds.mean(axis=0)
+
+    def get_params(self, deep: bool = True) -> dict:  # noqa: FBT001
+        return {"hgbr_params": self.hgbr_params, "n_members": self.n_members}
+
+    def set_params(self, **params: object) -> "_EnsembleLearner":
+        for k, v in params.items():
+            setattr(self, k, v)
+        return self
+
+
+def build_ensemble_learner(
+    hgbr_params: "dict | None" = None,
+    n_members: int = 5,
+    data_dir_preview: "str | Path | None" = None,  # noqa: ARG001
+) -> "_EnsembleLearner":
+    """Return an unfit 5-member HGBR ensemble for Variant B of 06_residual_ens.
+
+    Parameters
+    ----------
+    hgbr_params :
+        Base HGBR hyperparameter dict.  Defaults to ``HGBR_PARAMS_04``.
+    n_members :
+        Number of ensemble members (default 5).
+    data_dir_preview :
+        Unused.  Accepted for API consistency.
+
+    Returns
+    -------
+    _EnsembleLearner
+        Sklearn-duck-typed estimator.
+    """
+    return _EnsembleLearner(hgbr_params=hgbr_params or HGBR_PARAMS_04, n_members=n_members)
