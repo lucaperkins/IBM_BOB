@@ -12,6 +12,10 @@
 ``add_pk_rater_features``      — PK decay features, rater-bias corrector, and
                                  within-patient linear trajectory for 05_pk_rater.
 ``build_pk_rater_learner``     — same tuned HGBR as 04_best plus new features.
+``PatientStackLearner``        — two-stage stacker: stage 1 = 05_pk_rater
+                                 pipeline; stage 2 = HGBR on per-patient
+                                 prediction context features (07_patient_stack).
+``build_patient_stack_learner`` — builder for PatientStackLearner.
 
 Each builder is independent so experiments import only what they need.
 """
@@ -736,3 +740,347 @@ def build_ensemble_learner(
         Sklearn-duck-typed estimator.
     """
     return _EnsembleLearner(hgbr_params=hgbr_params or HGBR_PARAMS_04, n_members=n_members)
+
+
+# ---------------------------------------------------------------------------
+# 07_patient_stack  (two-stage patient-context stacker)
+# ---------------------------------------------------------------------------
+
+
+def _build_stage2_features(
+    patient_ids: "pd.Series",
+    ages: "pd.Series",
+    stage1_preds: "np.ndarray",
+    X_raw: pd.DataFrame,
+) -> pd.DataFrame:
+    """Build stage-2 features from stage-1 predictions within each patient.
+
+    For every visit the following are computed using *only* the other visits of
+    the same patient (leave-one-out context), so the visit's own target is never
+    used:
+
+    * ``ctx_mean``      — leave-one-out mean of the other visits' stage-1 preds.
+    * ``ctx_std``       — leave-one-out std (NaN for singletons).
+    * ``ctx_prev_pred`` — stage-1 prediction of the immediately preceding visit
+                          ordered by age (NaN if first visit).
+    * ``ctx_next_pred`` — stage-1 prediction of the immediately following visit
+                          ordered by age (NaN if last visit).
+    * ``ctx_loo_at_age``— leave-one-out per-patient OLS of predictions vs age
+                          evaluated at the current visit age (NaN for singletons).
+    * ``ctx_n_visits``  — total number of visits for the patient.
+    * ``stage1_pred``   — the visit's own stage-1 prediction (passed through).
+
+    Plus pass-through features from ``X_raw``: ``off``, ``on``, ``age``, and
+    the missingness flags ``off_missing``, ``on_missing``, ``ledd_missing``.
+
+    Uses a fully vectorised pandas implementation; the per-visit inner loop is
+    avoided via LOO identities: LOO_mean_i = (total_sum − p_i) / (n − 1).
+
+    Parameters
+    ----------
+    patient_ids :
+        Series of patient identifiers aligned with ``stage1_preds``.
+    ages :
+        Series of visit ages aligned with ``stage1_preds``.
+    stage1_preds :
+        1-D array of stage-1 predictions; one value per visit.
+    X_raw :
+        Original (pre-feature-engineering) DataFrame for this split, used to
+        extract ``off``, ``on``, ``age``, and missingness flags.
+
+    Returns
+    -------
+    pd.DataFrame
+        Stage-2 feature matrix; index matches ``patient_ids.index``.
+    """
+    import numpy as np
+
+    idx = patient_ids.index
+
+    # ----------------------------------------------------------------
+    # Working frame sorted by (patient_id, age) for shifted features
+    # ----------------------------------------------------------------
+    work = pd.DataFrame(
+        {
+            "pid": patient_ids.values,
+            "age": ages.values,
+            "pred": stage1_preds,
+        },
+        index=idx,
+    ).sort_values(["pid", "age"])
+
+    grp = work.groupby("pid", sort=False)
+
+    # --- ctx_n_visits ---
+    work["ctx_n_visits"] = grp["pred"].transform("count").astype(float)
+
+    # --- LOO mean: (sum − self) / (n − 1) ---
+    pat_sum = grp["pred"].transform("sum")
+    n = work["ctx_n_visits"]
+    work["ctx_mean"] = (pat_sum - work["pred"]) / (n - 1)
+    work.loc[n == 1, "ctx_mean"] = np.nan
+
+    # --- LOO std (sample std of the n-1 other visits) ---
+    # Unbiased: var = [sum_sq_loo - (sum_loo)²/(n-1)] / (n-2)
+    pat_sumsq = grp["pred"].transform(lambda x: (x**2).sum())
+    loo_sum_sq = pat_sumsq - work["pred"] ** 2          # sum of squares of the n-1 others
+    loo_sum = pat_sum - work["pred"]                     # sum of the n-1 others
+    loo_var = (loo_sum_sq - (loo_sum ** 2) / (n - 1)) / (n - 2)
+    loo_var = loo_var.clip(lower=0)                      # guard fp noise
+    work["ctx_std"] = np.where(n > 2, np.sqrt(loo_var), np.nan)
+    work.loc[n <= 2, "ctx_std"] = np.nan
+
+    # --- prev / next prediction (temporal neighbours within patient) ---
+    work["ctx_prev_pred"] = grp["pred"].shift(1)
+    work["ctx_next_pred"] = grp["pred"].shift(-1)
+
+    # --- LOO OLS slope/intercept via sum identities ---
+    # Full-patient sums for OLS
+    pat_n = n
+    pat_sum_a = grp["age"].transform("sum")
+    pat_sum_p = pat_sum
+    pat_sum_a2 = grp["age"].transform(lambda x: (x**2).sum())
+    # cross-product sum: sum(age_i * pred_i) for each patient, broadcast to all rows
+    work["_ap"] = work["age"] * work["pred"]
+    pat_sum_ap = grp["_ap"].transform("sum")
+
+    # LOO sums (remove current row)
+    loo_n = pat_n - 1
+    loo_sum_a = pat_sum_a - work["age"]
+    loo_sum_p = pat_sum - work["pred"]
+    loo_sum_a2 = pat_sum_a2 - work["age"] ** 2
+    loo_sum_ap = pat_sum_ap - work["_ap"]
+
+    denom = loo_n * loo_sum_a2 - loo_sum_a ** 2
+    has_enough = (loo_n >= 2) & (denom.abs() > 1e-10)
+    loo_slope = np.where(has_enough, (loo_n * loo_sum_ap - loo_sum_a * loo_sum_p) / denom, np.nan)
+    loo_intercept = np.where(
+        has_enough,
+        (loo_sum_p - loo_slope * loo_sum_a) / loo_n,
+        np.nan,
+    )
+    work["ctx_loo_at_age"] = np.where(
+        has_enough, loo_intercept + loo_slope * work["age"].values, np.nan
+    )
+
+    # ----------------------------------------------------------------
+    # Restore original index order and build output frame
+    # ----------------------------------------------------------------
+    work = work.drop(columns=["_ap"]).sort_index()
+
+    # Pass-through features from X_raw
+    off_missing = X_raw["off"].isna().astype(float)
+    on_missing = X_raw["on"].isna().astype(float)
+    ledd_missing = X_raw["ledd"].isna().astype(float) if "ledd" in X_raw.columns else pd.Series(0.0, index=idx)
+
+    feat = pd.DataFrame(
+        {
+            "stage1_pred": stage1_preds,
+            "ctx_mean": work["ctx_mean"].values,
+            "ctx_std": work["ctx_std"].values,
+            "ctx_prev_pred": work["ctx_prev_pred"].values,
+            "ctx_next_pred": work["ctx_next_pred"].values,
+            "ctx_loo_at_age": work["ctx_loo_at_age"].values,
+            "ctx_n_visits": work["ctx_n_visits"].values,
+            "off": X_raw["off"].values,
+            "on": X_raw["on"].values,
+            "age": X_raw["age"].values,
+            "off_missing": off_missing.values,
+            "on_missing": on_missing.values,
+            "ledd_missing": ledd_missing.values,
+        },
+        index=idx,
+    )
+    return feat
+
+
+class PatientStackLearner(BaseEstimator, RegressorMixin):
+    """Two-stage patient-context stacker for 07_patient_stack.
+
+    Stage 1 is the 05_pk_rater pipeline (PK-decay + rater-bias +
+    trajectory features + TableVectorizer + HGBR with ``HGBR_PARAMS_04``).
+    Stage 2 corrects each visit's prediction using the stage-1 predictions
+    of the *other* visits of the same patient, capturing the slowly-evolving
+    true OFF score signal that is otherwise lost in visit-level noise.
+
+    Fit protocol
+    ------------
+    1. Compute out-of-fold stage-1 predictions on the training rows via an
+       inner ``GroupKFold(3)`` on ``patient_id`` (no target leakage).
+    2. Refit stage 1 on all training rows.
+    3. Build stage-2 features per visit using the OOF predictions of the
+       patient's *other* visits (mean, std, prev/next, LOO-OLS, n_visits),
+       plus the visit's own stage-1 OOF prediction, ``off``, ``on``, ``age``,
+       and missingness flags.
+    4. Fit stage 2 (a small HGBR) on these features against the target.
+
+    Predict protocol
+    ----------------
+    Apply stage-1, build the same context features within each test patient,
+    then apply stage 2.
+
+    Constraints enforced
+    --------------------
+    * ``patient_id`` is never a model input; it is used only for grouping.
+    * Stage 2 is trained exclusively on out-of-fold stage-1 predictions.
+    * The target is never used to build any feature.
+
+    Parameters
+    ----------
+    hgbr_params_s1 :
+        HGBR hyperparameters for stage 1.  Defaults to ``HGBR_PARAMS_04``.
+    hgbr_params_s2 :
+        HGBR hyperparameters for stage 2.  Defaults to a small fast config.
+    inner_cv_splits :
+        Number of splits for the inner GroupKFold used to generate OOF
+        stage-1 predictions (default 3).
+    n_jobs :
+        Passed to stage-2 HGBR (default −1).
+    """
+
+    def __init__(
+        self,
+        hgbr_params_s1: "dict | None" = None,
+        hgbr_params_s2: "dict | None" = None,
+        inner_cv_splits: int = 3,
+        n_jobs: int = -1,
+    ) -> None:
+        self.hgbr_params_s1 = hgbr_params_s1
+        self.hgbr_params_s2 = hgbr_params_s2
+        self.inner_cv_splits = inner_cv_splits
+        self.n_jobs = n_jobs
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _make_stage1(self) -> "Pipeline":
+        """Return a fresh, unfit 05_pk_rater pipeline."""
+        from sklearn.ensemble import HistGradientBoostingRegressor
+        from sklearn.preprocessing import FunctionTransformer
+
+        params = self.hgbr_params_s1 if self.hgbr_params_s1 is not None else HGBR_PARAMS_04
+        feature_step = FunctionTransformer(_add_all_features_05)
+        drop_step = FunctionTransformer(_drop_patient_id_05)
+        tabular = skrub.tabular_pipeline("regressor")
+        hgbr = HistGradientBoostingRegressor(**params)
+        tabular_steps_no_last = tabular.steps[:-1]
+        return Pipeline(
+            steps=[
+                ("add_features", feature_step),
+                ("drop_patient_id", drop_step),
+                *tabular_steps_no_last,
+                ("histgradientboostingregressor", hgbr),
+            ]
+        )
+
+    def _make_stage2(self) -> "HistGradientBoostingRegressor":
+        from sklearn.ensemble import HistGradientBoostingRegressor
+
+        # HGBR is internally parallelised via OpenMP; n_jobs is not a valid param.
+        default = {
+            "max_iter": 300,
+            "max_leaf_nodes": 31,
+            "learning_rate": 0.05,
+            "min_samples_leaf": 20,
+            "random_state": 0,
+        }
+        params = self.hgbr_params_s2 if self.hgbr_params_s2 is not None else default
+        return HistGradientBoostingRegressor(**params)
+
+    # ------------------------------------------------------------------
+    # sklearn API
+    # ------------------------------------------------------------------
+
+    def fit(self, X: pd.DataFrame, y: pd.Series) -> "PatientStackLearner":
+        import numpy as np
+        from sklearn.model_selection import GroupKFold
+
+        groups = X["patient_id"]
+        gkf = GroupKFold(n_splits=self.inner_cv_splits)
+
+        # --- Step 1: OOF stage-1 predictions ---
+        oof_preds = np.full(len(y), np.nan)
+        for train_idx, val_idx in gkf.split(X, y, groups=groups):
+            X_tr, X_val = X.iloc[train_idx], X.iloc[val_idx]
+            y_tr = y.iloc[train_idx]
+            s1_fold = self._make_stage1()
+            s1_fold.fit(X_tr, y_tr)
+            oof_preds[val_idx] = s1_fold.predict(X_val)
+
+        # --- Step 2: Refit stage 1 on all training rows ---
+        self._stage1 = self._make_stage1()
+        self._stage1.fit(X, y)
+
+        # --- Step 3: Build stage-2 features from OOF predictions ---
+        feat2 = _build_stage2_features(
+            patient_ids=groups,
+            ages=X["age"],
+            stage1_preds=oof_preds,
+            X_raw=X,
+        )
+
+        # --- Step 4: Fit stage 2 ---
+        self._stage2 = self._make_stage2()
+        self._stage2.fit(feat2, y)
+
+        return self
+
+    def predict(self, X: pd.DataFrame) -> "np.ndarray":
+        groups = X["patient_id"]
+        s1_preds = self._stage1.predict(X)
+        feat2 = _build_stage2_features(
+            patient_ids=groups,
+            ages=X["age"],
+            stage1_preds=s1_preds,
+            X_raw=X,
+        )
+        return self._stage2.predict(feat2)
+
+    def get_params(self, deep: bool = True) -> dict:  # noqa: FBT001
+        return {
+            "hgbr_params_s1": self.hgbr_params_s1,
+            "hgbr_params_s2": self.hgbr_params_s2,
+            "inner_cv_splits": self.inner_cv_splits,
+            "n_jobs": self.n_jobs,
+        }
+
+    def set_params(self, **params: object) -> "PatientStackLearner":
+        for k, v in params.items():
+            setattr(self, k, v)
+        return self
+
+
+def build_patient_stack_learner(
+    hgbr_params_s1: "dict | None" = None,
+    hgbr_params_s2: "dict | None" = None,
+    inner_cv_splits: int = 3,
+    n_jobs: int = -1,
+    data_dir_preview: "str | Path | None" = None,  # noqa: ARG001
+) -> "PatientStackLearner":
+    """Return an unfit two-stage patient-context stacker for 07_patient_stack.
+
+    Parameters
+    ----------
+    hgbr_params_s1 :
+        HGBR hyperparameters for stage 1.  Defaults to ``HGBR_PARAMS_04``.
+    hgbr_params_s2 :
+        HGBR hyperparameters for stage 2.  Defaults to a small fast HGBR.
+    inner_cv_splits :
+        Inner GroupKFold splits for OOF stage-1 generation (default 3).
+    n_jobs :
+        Parallelism for stage-2 HGBR (default −1 = all cores).
+    data_dir_preview :
+        Unused.  Accepted for API consistency.
+
+    Returns
+    -------
+    PatientStackLearner
+        Sklearn-compatible estimator implementing fit / predict.
+    """
+    return PatientStackLearner(
+        hgbr_params_s1=hgbr_params_s1,
+        hgbr_params_s2=hgbr_params_s2,
+        inner_cv_splits=inner_cv_splits,
+        n_jobs=n_jobs,
+    )
