@@ -174,11 +174,13 @@ def build_hgbr_tabular_learner(
 # 04_best
 # ---------------------------------------------------------------------------
 
-#: Columns excluded from the raw feature matrix for 04_best.
-#: ``patient_id`` is KEPT in X so that ``add_best_features`` can use it
-#: for within-patient temporal features.  It is dropped inside the pipeline
-#: by a ``FunctionTransformer`` step before ``TableVectorizer`` sees it.
-#: ``target`` is the label and never in X.
+#: Columns to drop from raw X before the 04/05 feature pipelines.
+#: ``patient_id`` is deliberately NOT in this list — it is required by
+#: ``add_best_features`` and ``add_pk_rater_features`` for within-patient
+#: grouping; it is dropped inside the pipeline by a ``FunctionTransformer``
+#: step immediately before ``TableVectorizer`` so the estimator never sees it.
+#: Also used by 08_best_shot to reconstruct the 05 feature set for comparison.
+#: ``target`` is the label and must never appear in X.
 BEST_DROP_COLS: list[str] = ["target"]
 
 
@@ -424,7 +426,9 @@ def add_pk_rater_features(X: pd.DataFrame) -> pd.DataFrame:
         X[f"interact_on_{tau}h"] = X["on"].fillna(0) * d_on.fillna(0)
         X[f"interact_off_{tau}h"] = X["off"].fillna(0) * d_off.fillna(0)
 
-    # Ratio only where both decay values are available
+    # Ratio only where both decay values are available.
+    # +1e-9 prevents division by zero when off is taken at exactly time=0
+    # (i.e. when the patient was assessed immediately after intake: d_off1 ≈ 1).
     d_on1 = X["decay_on_1h"]
     d_off1 = X["decay_off_1h"]
     both_exist = d_on1.notna() & d_off1.notna()
@@ -442,7 +446,10 @@ def add_pk_rater_features(X: pd.DataFrame) -> pd.DataFrame:
     dev_off = X["off"] - patient_mean_off
     dev_on = X["on"] - patient_mean_on
 
-    # per-rater mean deviation, then broadcast back to rows
+    # Build an intermediary frame that pairs each row's rater_id with its deviation;
+    # groupby("rater_id").transform("mean") then broadcasts the per-rater mean
+    # back to every row that rater scored.  This captures systematic over/under-
+    # scoring habits across the whole dataset (train+test when called from 08).
     tmp = X[["rater_id"]].copy()
     tmp["dev_off"] = dev_off
     tmp["dev_on"] = dev_on
@@ -473,8 +480,10 @@ def add_pk_rater_features(X: pd.DataFrame) -> pd.DataFrame:
         off_vals = grp_df["off"].values.astype(float)
         mask_off = ~np.isnan(off_vals) & ~np.isnan(ages)
         if mask_off.sum() >= 2:
+            # OLS linear fit of off ~ age using only observed (non-NaN) visits.
             slope_off, intercept_off = np.polyfit(ages[mask_off], off_vals[mask_off], 1)
         else:
+            # Single observation or all missing: slope=0, intercept=observed mean or NaN.
             slope_off, intercept_off = 0.0, np.nanmean(off_vals) if mask_off.any() else np.nan
         X.loc[idx, "traj_off_slope"] = slope_off
         X.loc[idx, "traj_off_intercept"] = intercept_off
@@ -486,6 +495,7 @@ def add_pk_rater_features(X: pd.DataFrame) -> pd.DataFrame:
         if mask_on.sum() >= 2:
             slope_on, intercept_on = np.polyfit(ages[mask_on], on_vals[mask_on], 1)
         else:
+            # Insufficient observed on values — fall back to flat trajectory.
             slope_on, intercept_on = 0.0, np.nanmean(on_vals) if mask_on.any() else np.nan
         X.loc[idx, "traj_on_slope"] = slope_on
         X.loc[idx, "traj_on_intercept"] = intercept_on

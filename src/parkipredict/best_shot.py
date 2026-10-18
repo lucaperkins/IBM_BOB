@@ -56,7 +56,11 @@ HGBR_PARAMS_REF: dict = {
 
 
 def _patient_sorted(X: pd.DataFrame) -> pd.DataFrame:
-    """Return X sorted by (patient_id, age); original index unchanged."""
+    """Return X sorted by (patient_id, age); original index unchanged.
+
+    Sorting by age within each patient is required before any shift-based
+    temporal feature so that prev/next always means chronologically earlier/later.
+    """
     return X.sort_values(["patient_id", "age"])
 
 
@@ -87,7 +91,10 @@ def _adjusted_neighbours(
     X[f"{adj_col}_next1"] = grp[adj_col].shift(-1)
     X[f"{adj_col}_next2"] = grp[adj_col].shift(-2)
 
-    # Linear interpolation between prev1 and next1 (age-distance weighted midpoint)
+    # Linear interpolation between prev1 and next1 (age-distance weighted midpoint).
+    # w_prev = (age_next − age) / (age_next − age_prev): weight proportional to
+    # proximity of the NEXT visit (far next → visit is closer to prev → more weight
+    # on prev value).  Zero-range guard prevents division by zero for same-age visits.
     age_prev = grp["age"].shift(1)
     age_next = grp["age"].shift(-1)
     prev_val = X[f"{adj_col}_prev1"]
@@ -96,6 +103,7 @@ def _adjusted_neighbours(
     w_prev = (age_next - X["age"]) / age_range
     w_next = (X["age"] - age_prev) / age_range
     both_known = prev_val.notna() & next_val.notna()
+    # NaN when either neighbour is missing; HGBR handles the NaN natively.
     interp = np.where(both_known, w_prev * prev_val + w_next * next_val, np.nan)
     X[f"{adj_col}_interp"] = interp
 
@@ -133,7 +141,9 @@ def _age_weighted_interp(
     next_mask = obs_ages >= ai
 
     if not prev_mask.any() or not next_mask.any():
-        # Extrapolation: return nearest observed value
+        # Extrapolation: the visit falls outside the observed range for this
+        # patient; return the nearest observed value rather than extrapolating
+        # linearly, which would be unreliable with sparse observations.
         dists = np.abs(obs_ages - ai)
         return float(obs_vals[dists.argmin()])
 
@@ -178,6 +188,12 @@ def add_best_shot_features(X: pd.DataFrame) -> pd.DataFrame:
     # ------------------------------------------------------------------
     # Block 1 — Rater bias correction
     # ------------------------------------------------------------------
+    # For each column c ∈ {off, on, ledd}:
+    #   dev_i = c_i − patient_mean(c)         # deviation from own patient average
+    #   rater_bias_c = mean(dev_i) per rater  # systematic over/under-scoring
+    #   adjusted_c   = c − rater_bias_c       # score with rater effect removed
+    # This de-biases the raw scores before building temporal features so that
+    # neighbour comparisons reflect disease state rather than rater tendency.
     pat_grp = X.groupby("patient_id", sort=False)
 
     for col in ("off", "on", "ledd"):
@@ -185,6 +201,7 @@ def add_best_shot_features(X: pd.DataFrame) -> pd.DataFrame:
         dev = X[col] - patient_mean
 
         tmp = pd.DataFrame({"rater_id": X["rater_id"], "dev": dev})
+        # Per-rater mean deviation, broadcast back to each row of that rater.
         rater_bias = tmp.groupby("rater_id")["dev"].transform("mean")
 
         X[f"rater_bias_{col}"] = rater_bias
@@ -237,9 +254,12 @@ def add_best_shot_features(X: pd.DataFrame) -> pd.DataFrame:
             # local slope of off and on between prev and next observed values
             # (excluding the current visit's own value)
             def _local_slope(col_vals: np.ndarray, i: int) -> float:
+                # Rate of change between the nearest observed values bracketing
+                # visit i (excluding i itself), expressed in score units per year.
+                # Used as a local disease-progression signal for the HGBR.
                 obs_m = ~np.isnan(col_vals)
                 obs_m_excl = obs_m.copy()
-                obs_m_excl[i] = False
+                obs_m_excl[i] = False  # exclude self to avoid circularity
                 obs_a = ages[obs_m_excl]
                 obs_v = col_vals[obs_m_excl]
                 if len(obs_a) < 2:
@@ -248,10 +268,12 @@ def add_best_shot_features(X: pd.DataFrame) -> pd.DataFrame:
                 prev_m = obs_a <= ai
                 next_m = obs_a >= ai
                 if not prev_m.any() or not next_m.any():
+                    # Visit is outside the observed span — no bracketing pair.
                     return np.nan
                 p = np.where(prev_m)[0][-1]
                 nx = np.where(next_m)[0][0]
                 if obs_a[p] == obs_a[nx]:
+                    # Same age for both brackets — slope undefined.
                     return np.nan
                 return float((obs_v[nx] - obs_v[p]) / (obs_a[nx] - obs_a[p]))
 

@@ -13,7 +13,13 @@ from pathlib import Path
 
 
 def _find_skore(path: Path | None = None) -> Path:
-    """Return the nearest ``.skore``, walking up from ``path``, CWD, or this file."""
+    """Return the path to the nearest ``.skore`` credentials file.
+
+    If ``path`` is given, validate it directly.  Otherwise walk upward from
+    the current working directory and from this module's directory, stopping
+    at the first ``.git`` root found.  Raises ``FileNotFoundError`` with a
+    setup pointer if no ``.skore`` can be found.
+    """
     if path is not None:
         dest = Path(path)
         if dest.is_file():
