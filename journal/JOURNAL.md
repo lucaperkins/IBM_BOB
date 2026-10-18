@@ -12,8 +12,8 @@ stem).
 
 - **Project / dataset:** Parkinson's Disease UPDRS score prediction (patient visit tabular data)
 - **Goal:** Predict a patient's composite UPDRS score (`target`) from clinical visit features (age, medication, prior UPDRS sub-scores)
-- **Last experiment:** 07_patient_stack - done
-- **Last result:** RMSE 4.27 ± 0.12 (07_patient_stack, GroupKFold 5-fold); vs 06B_ensemble 4.40 ± 0.06
+- **Last experiment:** 08_best_shot - done
+- **Last result:** RMSE 4.10 (08_best_shot, GroupKFold 5-fold); vs 07_patient_stack 4.27
 
 - **Workspace decisions** (immutable unless the user pivots):
   - tabular library: pandas - recorded: 2025-10-07
@@ -44,6 +44,7 @@ stem).
 | `05_pk_rater` | PK decay curves (τ=1/2/4 h) + rater-bias correctors + within-patient OLS trajectory, reused 04 HGBR params, GroupKFold(5) | done | RMSE 4.43 ± 0.05 | [design note](05_pk_rater.md) |
 | `06_residual_ens` | Variant A: residual HGBR (target − off_proxy); Variant B: 5-seed HGBR ensemble; winner=06B_ensemble | done | RMSE 4.40 ± 0.06 (B wins; A=5.91 high-var) | [design note](06_residual_ens.md) |
 | `07_patient_stack` | Two-stage stacker: stage 1 = 05_pk_rater; stage 2 = HGBR on patient-context features of OOF stage-1 preds | done | RMSE 4.27 ± 0.12 (winner vs 05 and 06B) | [design note](07_patient_stack.md) |
+| `08_best_shot` | Rater-bias-adjusted features (off/on/ledd) + age-weighted interpolation on top of 05_pk_rater; RandomizedSearchCV retune (15 iter, inner GroupKFold(3)) and 5-seed ensemble; GroupKFold(5) outer | done | RMSE 4.10 (Kaggle public 3.937; vs 07_patient_stack 4.27 ± 0.12) | [design note](08_best_shot.md) |
 
 ## Backlog
 

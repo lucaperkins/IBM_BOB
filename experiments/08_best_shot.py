@@ -35,17 +35,15 @@
 #
 #   Q1. How many visits and distinct patients in train / test?  Typical and
 #       maximum visits per patient?
-#       Train: 44,590 visits, 5,576 distinct patients; average ~8 visits per
-#       patient (44 590 / 5 576).  Test: 11,013 rows (no patient-level count
-#       available in eda.md; patient overlap is zero — CONTEXT.md confirms the
-#       holdout is by patient).
+#       Train: 44,590 visits, 5,576 patients. Test: 11,013 visits, 1,395 patients
+#       (none shared with train). Visits per patient: median 7, average 8, maximum
+#       12.
 #
 #   Q2. Which three columns have the most missing values?  Fraction of visits
 #       with no off / no on / both missing?
-#       Top three by missingness: time_since_intake_off (78.8%), ledd (36.6%),
-#       time_since_intake_on (46.4%).  42.4% of visits have no off score;
-#       29.6% have no on score.  Visits where both are missing: not broken out
-#       in eda.md (see hub report eda).
+#       Top three by missingness: time_since_intake_off (79%), time_since_intake_on
+#       (46%), off (42%); then ledd (37%), gene (32%), on (30%). No visit has both 
+#       on and off missing (see hub report eda).
 #
 #   Q3. Distribution of target — range, skew?
 #       Target ranges 0–109.5 vs the theoretical 0–132 MDS-UPDRS range.
@@ -60,11 +58,9 @@
 #       has been de-biased to remove; also off is missing in 42% of rows).
 #
 #   Q5. Is ledd missing at random, or by cohort?
-#       ledd is missing in 36.6% of rows.  eda.md notes its missingness but
-#       does not break it down by cohort.  CONTEXT.md explains that ledd
-#       missingness is partly clinical: early patients or those not yet on
-#       stable levodopa may not have a recorded dose — so missingness is
-#       informative and correlates with disease stage / cohort.
+#       ledd is missing in about 36% of visits in cohort A and 43% in cohort B, 
+#       so it is not missing at random: it depends on the cohort (collection 
+#       protocol).
 #
 #   Q6. Which columns would you not feed to a model, and why?
 #       patient_id (identifier — feeding it lets the model memorize patients
@@ -121,10 +117,7 @@
 # Section 2 — Tweak Ridge and submit
 #
 #   Q1. How much does RMSE vary across alpha values?
-#       Ridge RMSE changes little across alpha (journal/02_ridge.md: all alpha
-#       values tried gave RMSE ≈ 10.60); when the feature set is small and
-#       n is large (~44k rows) the optimal weights are well-determined and
-#       the regularisation penalty has little effect.
+#       See hub report "02_ridge".
 #
 #   Q2. Did coefficients change much?
 #       With many observations and few features the least-squares solution is
@@ -134,12 +127,10 @@
 # Section 3 — Patient-grouped CV
 #
 #   Q1. Compare grouped-CV RMSE with random-split RMSE.  Which changed more?
-#       Dummy random-split RMSE was 16.48; under GroupKFold the dummy is
-#       similar (it predicts a constant so the split method barely matters).
-#       Ridge dropped from ~10.6 under GroupKFold to slightly higher with
-#       random split — the random split leaks patients, making the Ridge score
-#       look artificially good.  Ridge changed more because it actually learns
-#       patient-specific patterns.
+#       The dummy predicts a constant, so the split method barely changes it 
+#       (16.48). Models that can recognise a patient, like gradient boosting, 
+#       look much better under a random row split than under patient-grouped 
+#       CV, which is why the random split cannot be trusted here.
 #
 #   Q2. Which estimate (random or grouped CV) is closer to Kaggle public score?
 #       Grouped CV is closer, because the Kaggle holdout is also by patient
@@ -159,7 +150,7 @@
 #
 #   Q3. Feature importance — different from Ridge coefficients?
 #       HGBR permutation importance ranks off, on, age, ledd as most important
-#       (journal/05_pk_rater.md); Ridge coefficients rank off similarly but
+#       (journal/03_hgbr_tabular.md); Ridge coefficients rank off similarly but
 #       HGBR can exploit non-linear interactions and missing-value routing that
 #       Ridge cannot — so the ranking is similar at the top but diverges for
 #       lower-ranked features.
@@ -167,10 +158,9 @@
 # Section 5 — skrub tabular_pipeline
 #
 #   Q1. Did adding gene and cohort lower RMSE beyond fold spread?
-#       HGBR numeric-only was 7.45 ± 0.14; tabular_pipeline (all features
-#       including gene and cohort) also achieved RMSE 7.45 ± 0.14
-#       (journal/03_hgbr_tabular.md).  The gain from adding the categorical
-#       columns was negligible at this stage.
+#       The tabular_pipeline run (all columns including gene and cohort) gives 
+#       RMSE 7.45 ± 0.14 (journal 03); a numeric-only HGBR was not run in this 
+#       project, so the gain from categoricals cannot be isolated.
 #
 #   Q2. Which encoder did TableVectorizer pick per string column?
 #       (see hub report 03_hgbr_tabular for the fitted pipeline)
@@ -185,10 +175,10 @@
 #
 #   Q2. Which columns does X_op contain?  Do Index or patient_id appear in
 #       feature importance?
-#       X_op drops target but retains patient_id (it is dropped only before
-#       the estimator via a pipeline step).  Index is the DataFrame index, not
-#       a column, so it does not appear.  If patient_id appeared in feature
-#       importance that would indicate memorisation (leakage).
+#       DataOps were not used in this project (conceptual answer only). 
+#       patient_id appearing in the importances of 05 turned out to be a 
+#       measurement effect: it is dropped before the model, and shuffling it 
+#       scrambles the per-patient features.
 #
 # Section 7 — Wrap-up
 #
